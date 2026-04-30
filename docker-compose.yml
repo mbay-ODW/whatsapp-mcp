@@ -1,8 +1,6 @@
 services:
   whatsapp-bridge:
-    build:
-      context: .
-      dockerfile: Dockerfile.bridge
+    image: ghcr.io/mbay-odw/whatsapp-mcp-bridge:latest
     container_name: whatsapp-bridge
     restart: unless-stopped
     volumes:
@@ -13,9 +11,7 @@ services:
       - whatsapp-internal
 
   whatsapp-mcp:
-    build:
-      context: .
-      dockerfile: Dockerfile.mcp
+    image: ghcr.io/mbay-odw/whatsapp-mcp-server:latest
     container_name: whatsapp-mcp
     restart: unless-stopped
     depends_on:
