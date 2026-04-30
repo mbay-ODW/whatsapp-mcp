@@ -1,0 +1,64 @@
+services:
+  whatsapp-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile.bridge
+    container_name: whatsapp-bridge
+    restart: unless-stopped
+    volumes:
+      - whatsapp-store:/app/store
+    expose:
+      - "8080"
+    networks:
+      - whatsapp-internal
+
+  whatsapp-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    container_name: whatsapp-mcp
+    restart: unless-stopped
+    depends_on:
+      - whatsapp-bridge
+    environment:
+      - LOG_LEVEL=INFO
+      - MCP_TRANSPORT=sse
+      - PORT=8000
+      - MCP_API_KEY=${MCP_API_KEY}
+      - WHATSAPP_BRIDGE_URL=http://whatsapp-bridge:8080
+      - WHATSAPP_DB_PATH=/app/store/messages.db
+      - OIDC_INTROSPECTION_URL=${OIDC_INTROSPECTION_URL:-https://whatsapp-mcp.bay-ram.de/api/oidc/introspection}
+      - OIDC_CLIENT_ID=${OIDC_CLIENT_ID:-whatsapp-mcp}
+      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET}
+    volumes:
+      - whatsapp-store:/app/store
+    expose:
+      - "8000"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik"
+      - "traefik.http.routers.whatsapp-mcp-sse.rule=Host(`whatsapp-mcp.bay-ram.de`) && PathPrefix(`/sse`)"
+      - "traefik.http.routers.whatsapp-mcp-sse.entrypoints=websecure"
+      - "traefik.http.routers.whatsapp-mcp-sse.service=whatsapp-mcp-svc"
+      - "traefik.http.routers.whatsapp-mcp-sse.tls=true"
+      - "traefik.http.routers.whatsapp-mcp-sse.tls.certresolver=mydnschallenge"
+      - "traefik.http.routers.whatsapp-mcp-sse.middlewares=middlewares-rate-limit@file,middlewares-secure-headers@file"
+      - "traefik.http.routers.whatsapp-mcp-msg.rule=Host(`whatsapp-mcp.bay-ram.de`) && PathPrefix(`/messages`)"
+      - "traefik.http.routers.whatsapp-mcp-msg.entrypoints=websecure"
+      - "traefik.http.routers.whatsapp-mcp-msg.service=whatsapp-mcp-svc"
+      - "traefik.http.routers.whatsapp-mcp-msg.tls=true"
+      - "traefik.http.routers.whatsapp-mcp-msg.tls.certresolver=mydnschallenge"
+      - "traefik.http.routers.whatsapp-mcp-msg.middlewares=middlewares-rate-limit@file,middlewares-secure-headers@file"
+      - "traefik.http.services.whatsapp-mcp-svc.loadbalancer.server.port=8000"
+    networks:
+      - whatsapp-internal
+      - traefik
+
+volumes:
+  whatsapp-store:
+
+networks:
+  whatsapp-internal:
+    internal: true
+  traefik:
+    external: true

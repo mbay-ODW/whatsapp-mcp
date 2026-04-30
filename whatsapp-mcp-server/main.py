@@ -246,6 +246,73 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "message": "Failed to download media"
         }
 
+def _run_sse() -> None:
+    import os
+    import uvicorn
+    import httpx as _httpx
+    import logging
+    from mcp.server.sse import SseServerTransport
+    from starlette.applications import Starlette
+    from starlette.requests import Request
+    from starlette.responses import Response
+    from starlette.routing import Mount, Route
+
+    _log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(level=getattr(logging, _log_level, logging.INFO), format="%(asctime)s [%(levelname)s] %(message)s")
+
+    mcp_api_key = os.getenv("MCP_API_KEY", "")
+    oidc_introspection_url = os.getenv("OIDC_INTROSPECTION_URL", "")
+    oidc_client_id = os.getenv("OIDC_CLIENT_ID", "")
+    oidc_client_secret = os.getenv("OIDC_CLIENT_SECRET", "")
+
+    async def _is_authorized(request: Request) -> bool:
+        if not mcp_api_key:
+            return True
+        auth = request.headers.get("Authorization", "")
+        if auth == f"Bearer {mcp_api_key}":
+            logging.info("Auth OK: statischer Bearer Token")
+            return True
+        if auth.startswith("Bearer ") and oidc_introspection_url and oidc_client_id and oidc_client_secret:
+            jwt_token = auth[7:]
+            try:
+                async with _httpx.AsyncClient() as http:
+                    resp = await http.post(
+                        oidc_introspection_url,
+                        data={"token": jwt_token},
+                        auth=(oidc_client_id, oidc_client_secret),
+                        timeout=5.0,
+                    )
+                    data = resp.json()
+                    active = data.get("active", False)
+                    logging.info("OIDC Introspection: active=%s", active)
+                    return active
+            except Exception as e:
+                logging.error("Introspection fehlgeschlagen: %s", e)
+        return False
+
+    sse = SseServerTransport("/messages/")
+    _server = mcp._mcp_server
+
+    async def handle_sse(request: Request):
+        if not await _is_authorized(request):
+            return Response("Unauthorized", status_code=401)
+        async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+            await _server.run(streams[0], streams[1], _server.create_initialization_options())
+
+    app = Starlette(
+        routes=[
+            Route("/sse", endpoint=handle_sse),
+            Mount("/messages/", app=sse.handle_post_message),
+        ],
+    )
+
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+
 if __name__ == "__main__":
-    # Initialize and run the server
-    mcp.run(transport='stdio')
+    import os
+    if os.getenv("MCP_TRANSPORT", "stdio") == "sse":
+        _run_sse()
+    else:
+        mcp.run(transport='stdio')

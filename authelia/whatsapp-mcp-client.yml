@@ -1,0 +1,13 @@
+# Diesen Block in deine Authelia identity_providers.oidc.clients Liste einfügen
+
+- client_id: whatsapp-mcp
+  client_name: Claude WhatsApp MCP
+  authorization_policy: one_factor
+  client_secret: 'HASH_HIER_EINTRAGEN'   # authelia crypto hash generate --password dein_secret
+  redirect_uris:
+    - https://claude.ai/api/mcp/auth_callback
+  scopes: [openid, profile, email, offline_access, address, phone, groups]
+  grant_types: [authorization_code, refresh_token]
+  response_types: [code]
+  token_endpoint_auth_method: client_secret_post
+  introspection_endpoint_auth_method: client_secret_basic

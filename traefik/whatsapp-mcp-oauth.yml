@@ -1,0 +1,62 @@
+http:
+  middlewares:
+    rewrite-authorize-whatsapp:
+      replacePath:
+        path: "/api/oidc/authorization"
+
+  routers:
+    whatsapp-mcp-authorize:
+      rule: "Host(`whatsapp-mcp.bay-ram.de`) && PathPrefix(`/authorize`)"
+      entrypoints: [websecure]
+      service: authelia-oidc
+      middlewares: [rewrite-authorize-whatsapp]
+      tls:
+        certResolver: mydnschallenge
+
+    whatsapp-mcp-root:
+      rule: "Host(`whatsapp-mcp.bay-ram.de`) && Path(`/`)"
+      entrypoints: [websecure]
+      service: authelia-oidc
+      tls:
+        certResolver: mydnschallenge
+
+    whatsapp-mcp-oidc:
+      rule: "Host(`whatsapp-mcp.bay-ram.de`) && PathPrefix(`/api/oidc`)"
+      entrypoints: [websecure]
+      service: authelia-oidc
+      tls:
+        certResolver: mydnschallenge
+
+    whatsapp-mcp-api:
+      rule: "Host(`whatsapp-mcp.bay-ram.de`) && PathPrefix(`/api`)"
+      entrypoints: [websecure]
+      service: authelia-oidc
+      tls:
+        certResolver: mydnschallenge
+
+    whatsapp-mcp-consent:
+      rule: "Host(`whatsapp-mcp.bay-ram.de`) && PathPrefix(`/consent`)"
+      entrypoints: [websecure]
+      service: authelia-oidc
+      tls:
+        certResolver: mydnschallenge
+
+    whatsapp-mcp-static:
+      rule: "Host(`whatsapp-mcp.bay-ram.de`) && PathPrefix(`/static`)"
+      entrypoints: [websecure]
+      service: authelia-oidc
+      tls:
+        certResolver: mydnschallenge
+
+    whatsapp-mcp-wellknown:
+      rule: "Host(`whatsapp-mcp.bay-ram.de`) && PathPrefix(`/.well-known`)"
+      entrypoints: [websecure]
+      service: authelia-oidc
+      tls:
+        certResolver: mydnschallenge
+
+  services:
+    authelia-oidc:
+      loadBalancer:
+        servers:
+          - url: "http://authelia:9091"
