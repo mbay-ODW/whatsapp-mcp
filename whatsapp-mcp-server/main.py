@@ -423,18 +423,57 @@ def _run_sse() -> None:
     sse = SseServerTransport("/messages/")
     _server = mcp._mcp_server
 
-    # Modern Claude.ai sends a POST /sse probe (Streamable-HTTP semantics)
-    # before falling back to plain SSE. Returning 405 there confused some
-    # client versions. Acknowledge the probe with a simple 200 + the
-    # endpoint URL the client should actually use.
-    async def handle_sse_post_probe(request: Request):
+    # Modern Claude.ai connects with Streamable-HTTP semantics
+    # (POST /sse with a real JSON-RPC payload, not a probe). We MUST
+    # speak Streamable-HTTP on that path or the connector cannot
+    # initialise. Mount the SDK's StreamableHTTPServerTransport in
+    # stateless mode (one transport per request – fits FastMCP's
+    # request-scoped tools).
+    import anyio
+    from mcp.server.streamable_http import StreamableHTTPServerTransport
+
+    async def handle_streamable_http(request: Request):
+        if not await _is_authorized(request):
+            log.warning("[/sse POST] denied (unauthenticated)")
+            return Response("Unauthorized", status_code=401)
         log.info(
-            "[/sse POST] streamable-HTTP probe acknowledged (use GET /sse for SSE)"
+            "[/sse POST] streamable-http request from %s",
+            request.client.host if request.client else "?",
         )
-        return Response(
-            content='{"transport":"sse","sse_endpoint":"/sse"}',
-            media_type="application/json",
+
+        # ASGI pattern: a Starlette endpoint must return a Response, but
+        # StreamableHTTPServerTransport.handle_request writes the response
+        # to the ASGI `send` callable directly. Using `request._send`
+        # is the same trick we already use for SSE.
+        transport = StreamableHTTPServerTransport(
+            mcp_session_id=None, is_json_response_enabled=True
         )
+        try:
+            async with transport.connect() as streams:
+                async with anyio.create_task_group() as tg:
+
+                    async def _run_server():
+                        try:
+                            await _server.run(
+                                streams[0],
+                                streams[1],
+                                _server.create_initialization_options(),
+                            )
+                        except Exception:
+                            log.exception("[/sse POST] server.run crashed")
+
+                    tg.start_soon(_run_server)
+                    await transport.handle_request(
+                        request.scope, request.receive, request._send
+                    )
+                    tg.cancel_scope.cancel()
+        except Exception:
+            log.exception("[/sse POST] streamable-http handler error")
+            raise
+        # Starlette wants a Response object even though we already wrote
+        # one to send(); returning an empty 200 is harmless because the
+        # response stream is already finished at this point.
+        return Response()
 
     sessions: dict[str, float] = {}
 
@@ -499,8 +538,11 @@ def _run_sse() -> None:
     # itself (e.g. method-not-allowed on POST /sse).
     app = Starlette(
         routes=[
+            # Streamable-HTTP (current spec) – Claude.ai uses this first.
+            Route("/sse", endpoint=handle_streamable_http, methods=["POST"]),
+            Route("/mcp", endpoint=handle_streamable_http, methods=["POST"]),
+            # Classic SSE transport – fallback for Claude Desktop / older clients.
             Route("/sse", endpoint=handle_sse, methods=["GET"]),
-            Route("/sse", endpoint=handle_sse_post_probe, methods=["POST"]),
             Mount("/messages/", app=handle_messages),
         ],
         middleware=[Middleware(RequestLogMiddleware)],
