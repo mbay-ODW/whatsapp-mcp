@@ -266,11 +266,23 @@ def _run_sse() -> None:
     # SSE connection lifecycle.
     # ------------------------------------------------------------------
     _log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    _level_int = getattr(logging, _log_level, logging.INFO)
+    # `force=True` is required because uvicorn / FastMCP install root
+    # handlers before we get here, which would make a plain basicConfig()
+    # silently a no-op (and DEBUG lines would never show up).
     logging.basicConfig(
-        level=getattr(logging, _log_level, logging.INFO),
+        level=_level_int,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        force=True,
     )
+    # Belt-and-braces: explicitly set our logger AND the root logger, so
+    # logs from inside library callbacks honour the level too.
+    logging.getLogger().setLevel(_level_int)
     log = logging.getLogger("whatsapp-mcp")
+    log.setLevel(_level_int)
+    # Make sure uvicorn's own loggers don't drown out / override us.
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        logging.getLogger(name).setLevel(_level_int)
 
     mcp_api_key = os.getenv("MCP_API_KEY", "")
     oidc_introspection_url = os.getenv("OIDC_INTROSPECTION_URL", "")
@@ -411,6 +423,19 @@ def _run_sse() -> None:
     sse = SseServerTransport("/messages/")
     _server = mcp._mcp_server
 
+    # Modern Claude.ai sends a POST /sse probe (Streamable-HTTP semantics)
+    # before falling back to plain SSE. Returning 405 there confused some
+    # client versions. Acknowledge the probe with a simple 200 + the
+    # endpoint URL the client should actually use.
+    async def handle_sse_post_probe(request: Request):
+        log.info(
+            "[/sse POST] streamable-HTTP probe acknowledged (use GET /sse for SSE)"
+        )
+        return Response(
+            content='{"transport":"sse","sse_endpoint":"/sse"}',
+            media_type="application/json",
+        )
+
     sessions: dict[str, float] = {}
 
     async def handle_sse(request: Request):
@@ -466,13 +491,20 @@ def _run_sse() -> None:
         )
         await sse.handle_post_message(scope, receive, send)
 
+    from starlette.middleware import Middleware
+
+    # Pass the middleware via the constructor (rather than add_middleware
+    # afterwards) so it definitely wraps the routing layer – otherwise the
+    # debug request log silently misses 4xx responses produced by Starlette
+    # itself (e.g. method-not-allowed on POST /sse).
     app = Starlette(
         routes=[
             Route("/sse", endpoint=handle_sse, methods=["GET"]),
+            Route("/sse", endpoint=handle_sse_post_probe, methods=["POST"]),
             Mount("/messages/", app=handle_messages),
         ],
+        middleware=[Middleware(RequestLogMiddleware)],
     )
-    app.add_middleware(RequestLogMiddleware)
 
     port = int(os.getenv("PORT", "8000"))
     log.info("whatsapp-mcp listening on :%d (LOG_LEVEL=%s)", port, _log_level)
