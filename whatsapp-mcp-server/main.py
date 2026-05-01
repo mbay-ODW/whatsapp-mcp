@@ -298,10 +298,13 @@ def _run_sse() -> None:
             return Response("Unauthorized", status_code=401)
         async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
             await _server.run(streams[0], streams[1], _server.create_initialization_options())
+        # Must return Response() – otherwise Starlette calls None() on disconnect
+        # and logs "Exception in ASGI application" (MCP SDK >= 1.6 requirement)
+        return Response()
 
     app = Starlette(
         routes=[
-            Route("/sse", endpoint=handle_sse),
+            Route("/sse", endpoint=handle_sse, methods=["GET"]),
             Mount("/messages/", app=sse.handle_post_message),
         ],
     )

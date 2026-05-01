@@ -4,7 +4,7 @@ RUN pip install --no-cache-dir uv
 COPY whatsapp-mcp-server/pyproject.toml .
 RUN uv pip install --system \
     "httpx>=0.28.1" \
-    "mcp[cli]>=1.6.0" \
+    "mcp[cli]>=1.10.0,<1.20.0" \
     "requests>=2.32.3" \
     "uvicorn>=0.34.0" \
     "starlette>=0.46.0"
