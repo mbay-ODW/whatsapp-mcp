@@ -247,69 +247,235 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
         }
 
 def _run_sse() -> None:
-    import os
-    import uvicorn
-    import httpx as _httpx
     import logging
+    import os
+    import time
+
+    import httpx as _httpx
+    import uvicorn
     from mcp.server.sse import SseServerTransport
     from starlette.applications import Starlette
+    from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.requests import Request
     from starlette.responses import Response
     from starlette.routing import Mount, Route
 
+    # ------------------------------------------------------------------
+    # Logging – LOG_LEVEL env var (debug|info|warning|error). Use DEBUG to
+    # see every incoming request, the full auth decision path and the
+    # SSE connection lifecycle.
+    # ------------------------------------------------------------------
     _log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(level=getattr(logging, _log_level, logging.INFO), format="%(asctime)s [%(levelname)s] %(message)s")
+    logging.basicConfig(
+        level=getattr(logging, _log_level, logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    log = logging.getLogger("whatsapp-mcp")
 
     mcp_api_key = os.getenv("MCP_API_KEY", "")
     oidc_introspection_url = os.getenv("OIDC_INTROSPECTION_URL", "")
     oidc_client_id = os.getenv("OIDC_CLIENT_ID", "")
     oidc_client_secret = os.getenv("OIDC_CLIENT_SECRET", "")
 
+    auth_configured = bool(mcp_api_key) or all(
+        (oidc_introspection_url, oidc_client_id, oidc_client_secret)
+    )
+
+    log.info(
+        "[auth] config: MCP_API_KEY=%s OIDC_INTROSPECTION_URL=%s OIDC_CLIENT_ID=%s OIDC_CLIENT_SECRET=%s",
+        f"set({len(mcp_api_key)} chars)" if mcp_api_key else "NOT SET",
+        oidc_introspection_url or "NOT SET",
+        oidc_client_id or "NOT SET",
+        f"set({len(oidc_client_secret)} chars)" if oidc_client_secret else "NOT SET",
+    )
+    if not auth_configured:
+        log.warning(
+            "[auth] NEITHER static MCP_API_KEY NOR a complete OIDC triple is configured – ALL requests will pass unauthenticated."
+        )
+
+    def _auth_preview(auth: str) -> str:
+        if not auth:
+            return "(none)"
+        return auth[:20] + ("…" if len(auth) > 20 else "")
+
     async def _is_authorized(request: Request) -> bool:
-        if not mcp_api_key:
-            return True
+        tag = f"{request.method} {request.url.path}"
         auth = request.headers.get("Authorization", "")
-        if auth == f"Bearer {mcp_api_key}":
-            logging.info("Auth OK: statischer Bearer Token")
+        log.debug("[auth] %s – Authorization: %s", tag, _auth_preview(auth))
+
+        if not mcp_api_key:
+            log.debug("[auth] %s – no MCP_API_KEY configured, passing through", tag)
             return True
-        if auth.startswith("Bearer ") and oidc_introspection_url and oidc_client_id and oidc_client_secret:
-            jwt_token = auth[7:]
-            try:
-                async with _httpx.AsyncClient() as http:
-                    resp = await http.post(
-                        oidc_introspection_url,
-                        data={"token": jwt_token},
-                        auth=(oidc_client_id, oidc_client_secret),
-                        timeout=5.0,
+        if not auth:
+            log.warning("[auth] %s – DENY: no Authorization header", tag)
+            return False
+        if auth == f"Bearer {mcp_api_key}":
+            log.info("[auth] %s – OK: static MCP_API_KEY matched", tag)
+            return True
+        if not auth.startswith("Bearer "):
+            log.warning("[auth] %s – DENY: Authorization is not a Bearer scheme", tag)
+            return False
+        if not (oidc_introspection_url and oidc_client_id and oidc_client_secret):
+            log.warning(
+                "[auth] %s – DENY: Bearer JWT presented but OIDC introspection not fully configured (url=%s id=%s secret=%s)",
+                tag,
+                "ok" if oidc_introspection_url else "MISSING",
+                "ok" if oidc_client_id else "MISSING",
+                "ok" if oidc_client_secret else "MISSING",
+            )
+            return False
+
+        jwt_token = auth[7:]
+        log.debug(
+            "[auth] %s – introspecting token (len=%d) against %s",
+            tag,
+            len(jwt_token),
+            oidc_introspection_url,
+        )
+        started = time.monotonic()
+        try:
+            async with _httpx.AsyncClient(timeout=5.0) as http:
+                resp = await http.post(
+                    oidc_introspection_url,
+                    data={"token": jwt_token},
+                    auth=(oidc_client_id, oidc_client_secret),
+                )
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                body = resp.text
+                log.debug(
+                    "[auth] %s – introspection HTTP %s in %dms, body: %s",
+                    tag,
+                    resp.status_code,
+                    elapsed_ms,
+                    body[:300],
+                )
+                if resp.status_code != 200:
+                    log.warning(
+                        "[auth] %s – DENY: introspection returned non-200 (%s)",
+                        tag,
+                        resp.status_code,
                     )
-                    data = resp.json()
-                    active = data.get("active", False)
-                    logging.info("OIDC Introspection: active=%s", active)
-                    return active
-            except Exception as e:
-                logging.error("Introspection fehlgeschlagen: %s", e)
-        return False
+                    return False
+                data = resp.json()
+                active = bool(data.get("active"))
+                if active:
+                    log.info(
+                        "[auth] %s – OK: OIDC token active sub=%s scope=%s",
+                        tag,
+                        data.get("sub", "?"),
+                        data.get("scope", "?"),
+                    )
+                else:
+                    log.warning("[auth] %s – DENY: OIDC token not active", tag)
+                return active
+        except Exception as e:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            log.error(
+                "[auth] %s – introspection exception after %dms: %s",
+                tag,
+                elapsed_ms,
+                e,
+            )
+            return False
+
+    class RequestLogMiddleware(BaseHTTPMiddleware):
+        """Logs every request that hits the app, even ones that 404 in routing."""
+
+        async def dispatch(self, request, call_next):  # type: ignore[override]
+            t0 = time.monotonic()
+            log.debug(
+                "→ %s %s  ip=%s  ua=%s  auth=%s",
+                request.method,
+                request.url.path,
+                request.client.host if request.client else "?",
+                request.headers.get("user-agent", "?")[:60],
+                _auth_preview(request.headers.get("Authorization", "")),
+            )
+            try:
+                response = await call_next(request)
+            except Exception:
+                log.exception(
+                    "← %s %s – handler raised", request.method, request.url.path
+                )
+                raise
+            dt_ms = int((time.monotonic() - t0) * 1000)
+            log.debug(
+                "← %s %s → %d  in %dms",
+                request.method,
+                request.url.path,
+                response.status_code,
+                dt_ms,
+            )
+            return response
 
     sse = SseServerTransport("/messages/")
     _server = mcp._mcp_server
 
+    sessions: dict[str, float] = {}
+
     async def handle_sse(request: Request):
+        client_ip = request.client.host if request.client else "?"
+        log.info("[/sse GET] new SSE connection from %s", client_ip)
         if not await _is_authorized(request):
+            log.warning("[/sse GET] denied (unauthenticated) from %s", client_ip)
             return Response("Unauthorized", status_code=401)
-        async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
-            await _server.run(streams[0], streams[1], _server.create_initialization_options())
+        opened = time.monotonic()
+        try:
+            async with sse.connect_sse(
+                request.scope, request.receive, request._send
+            ) as streams:
+                # Track the live session for visibility.
+                session_id = str(id(streams))
+                sessions[session_id] = opened
+                log.info(
+                    "[/sse GET] stream open  session=%s  active_sessions=%d",
+                    session_id,
+                    len(sessions),
+                )
+                try:
+                    await _server.run(
+                        streams[0], streams[1], _server.create_initialization_options()
+                    )
+                finally:
+                    duration = int(time.monotonic() - sessions.pop(session_id, opened))
+                    log.info(
+                        "[/sse GET] stream closed session=%s after %ds  remaining=%d",
+                        session_id,
+                        duration,
+                        len(sessions),
+                    )
+        except Exception:
+            log.exception("[/sse GET] handler crashed")
+            raise
         # Must return Response() – otherwise Starlette calls None() on disconnect
         # and logs "Exception in ASGI application" (MCP SDK >= 1.6 requirement)
         return Response()
 
+    # /messages/{session_id} – authenticate too, so we get logs on those POSTs.
+    async def handle_messages(scope, receive, send):  # ASGI app wrapper
+        from starlette.requests import Request as _Req
+
+        req = _Req(scope, receive=receive)
+        if not await _is_authorized(req):
+            response = Response("Unauthorized", status_code=401)
+            await response(scope, receive, send)
+            return
+        log.debug(
+            "[/messages POST] session_id=%s",
+            req.query_params.get("session_id", "?"),
+        )
+        await sse.handle_post_message(scope, receive, send)
+
     app = Starlette(
         routes=[
             Route("/sse", endpoint=handle_sse, methods=["GET"]),
-            Mount("/messages/", app=sse.handle_post_message),
+            Mount("/messages/", app=handle_messages),
         ],
     )
+    app.add_middleware(RequestLogMiddleware)
 
     port = int(os.getenv("PORT", "8000"))
+    log.info("whatsapp-mcp listening on :%d (LOG_LEVEL=%s)", port, _log_level)
     uvicorn.run(app, host="0.0.0.0", port=port)
 
 
