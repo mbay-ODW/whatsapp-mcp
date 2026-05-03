@@ -1,0 +1,43 @@
+# Local development stack – binds to 127.0.0.1 only, no Traefik, no
+# Authelia, no TLS.
+#
+# Both the WhatsApp bridge and the MCP server start; the bridge needs
+# QR-code login on first start (use `docker logs -f whatsapp-bridge-local`
+# and scan the code with your phone).
+#
+# Usage:
+#   docker compose -f docker-compose.local.yml up
+#
+# Connect from Claude Desktop with:
+#   {"mcpServers": {"whatsapp-local": {"url": "http://localhost:8005/sse"}}}
+#
+# Auth is intentionally disabled – do NOT expose this port to the network.
+services:
+  whatsapp-bridge:
+    image: ghcr.io/mbay-odw/whatsapp-mcp-bridge:latest
+    container_name: whatsapp-bridge-local
+    restart: unless-stopped
+    volumes:
+      - whatsapp_bridge_local_data:/app/store
+    # Bridge is only reachable from the MCP server, no host port mapping.
+
+  whatsapp-mcp:
+    image: ghcr.io/mbay-odw/whatsapp-mcp-server:latest
+    container_name: whatsapp-mcp-local
+    restart: unless-stopped
+    depends_on:
+      - whatsapp-bridge
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
+      - MCP_TRANSPORT=sse
+      - PORT=8000
+      - WHATSAPP_BRIDGE_URL=http://whatsapp-bridge:8080
+      - WHATSAPP_DB_PATH=/app/store/messages.db
+      # Auth deliberately not set → all requests pass through.
+    volumes:
+      - whatsapp_bridge_local_data:/app/store
+    ports:
+      - "127.0.0.1:8005:8000"
+
+volumes:
+  whatsapp_bridge_local_data:
