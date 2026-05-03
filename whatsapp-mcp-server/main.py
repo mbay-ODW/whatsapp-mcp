@@ -310,23 +310,26 @@ def _run_sse() -> None:
             return "(none)"
         return auth[:20] + ("…" if len(auth) > 20 else "")
 
-    async def _is_authorized(request: Request) -> bool:
+    # Auth result: (ok, reason). reason ∈ {None, "no_header", "invalid_token"}.
+    # Used by _unauthorized() to build the right WWW-Authenticate hint so
+    # Claude.ai can distinguish "refresh your token" from "start over".
+    async def _is_authorized(request: Request) -> tuple[bool, str | None]:
         tag = f"{request.method} {request.url.path}"
         auth = request.headers.get("Authorization", "")
         log.debug("[auth] %s – Authorization: %s", tag, _auth_preview(auth))
 
         if not mcp_api_key:
             log.debug("[auth] %s – no MCP_API_KEY configured, passing through", tag)
-            return True
+            return True, None
         if not auth:
             log.warning("[auth] %s – DENY: no Authorization header", tag)
-            return False
+            return False, "no_header"
         if auth == f"Bearer {mcp_api_key}":
             log.info("[auth] %s – OK: static MCP_API_KEY matched", tag)
-            return True
+            return True, None
         if not auth.startswith("Bearer "):
             log.warning("[auth] %s – DENY: Authorization is not a Bearer scheme", tag)
-            return False
+            return False, "invalid_token"
         if not (oidc_introspection_url and oidc_client_id and oidc_client_secret):
             log.warning(
                 "[auth] %s – DENY: Bearer JWT presented but OIDC introspection not fully configured (url=%s id=%s secret=%s)",
@@ -335,7 +338,7 @@ def _run_sse() -> None:
                 "ok" if oidc_client_id else "MISSING",
                 "ok" if oidc_client_secret else "MISSING",
             )
-            return False
+            return False, "invalid_token"
 
         jwt_token = auth[7:]
         log.debug(
@@ -367,7 +370,7 @@ def _run_sse() -> None:
                         tag,
                         resp.status_code,
                     )
-                    return False
+                    return False, "invalid_token"
                 data = resp.json()
                 active = bool(data.get("active"))
                 if active:
@@ -377,9 +380,9 @@ def _run_sse() -> None:
                         data.get("sub", "?"),
                         data.get("scope", "?"),
                     )
-                else:
-                    log.warning("[auth] %s – DENY: OIDC token not active", tag)
-                return active
+                    return True, None
+                log.warning("[auth] %s – DENY: OIDC token not active", tag)
+                return False, "invalid_token"
         except Exception as e:
             elapsed_ms = int((time.monotonic() - started) * 1000)
             log.error(
@@ -388,7 +391,20 @@ def _run_sse() -> None:
                 elapsed_ms,
                 e,
             )
-            return False
+            return False, "invalid_token"
+
+    def _unauthorized(reason: str | None) -> Response:
+        """Build a 401 with an RFC 6750 WWW-Authenticate hint so the OAuth
+        client knows whether to refresh its token or re-prompt the user."""
+        realm = "whatsapp-mcp"
+        if reason == "invalid_token":
+            www = (
+                f'Bearer realm="{realm}", error="invalid_token", '
+                f'error_description="The access token expired or is invalid"'
+            )
+        else:
+            www = f'Bearer realm="{realm}"'
+        return Response("Unauthorized", status_code=401, headers={"WWW-Authenticate": www})
 
     class RequestLogMiddleware(BaseHTTPMiddleware):
         """Logs every request that hits the app, even ones that 404 in routing."""
@@ -433,9 +449,10 @@ def _run_sse() -> None:
     from mcp.server.streamable_http import StreamableHTTPServerTransport
 
     async def handle_streamable_http(request: Request):
-        if not await _is_authorized(request):
-            log.warning("[/sse POST] denied (unauthenticated)")
-            return Response("Unauthorized", status_code=401)
+        ok, reason = await _is_authorized(request)
+        if not ok:
+            log.warning("[/sse POST] denied (unauthenticated) reason=%s", reason)
+            return _unauthorized(reason)
         log.info(
             "[/sse POST] streamable-http request from %s",
             request.client.host if request.client else "?",
@@ -480,9 +497,10 @@ def _run_sse() -> None:
     async def handle_sse(request: Request):
         client_ip = request.client.host if request.client else "?"
         log.info("[/sse GET] new SSE connection from %s", client_ip)
-        if not await _is_authorized(request):
-            log.warning("[/sse GET] denied (unauthenticated) from %s", client_ip)
-            return Response("Unauthorized", status_code=401)
+        ok, reason = await _is_authorized(request)
+        if not ok:
+            log.warning("[/sse GET] denied (unauthenticated) from %s reason=%s", client_ip, reason)
+            return _unauthorized(reason)
         opened = time.monotonic()
         try:
             async with sse.connect_sse(
@@ -520,8 +538,9 @@ def _run_sse() -> None:
         from starlette.requests import Request as _Req
 
         req = _Req(scope, receive=receive)
-        if not await _is_authorized(req):
-            response = Response("Unauthorized", status_code=401)
+        ok, reason = await _is_authorized(req)
+        if not ok:
+            response = _unauthorized(reason)
             await response(scope, receive, send)
             return
         log.debug(
