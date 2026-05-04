@@ -453,6 +453,18 @@ def _run_sse() -> None:
     import anyio
     from mcp.server.streamable_http import StreamableHTTPServerTransport
 
+    class _AlreadySent(Response):
+        """No-op response for handlers that have already streamed their
+        full response via the raw ASGI `send` callable. Returning a
+        regular Response would make Starlette try to send a second one
+        and crash with 'response already completed'."""
+
+        def __init__(self) -> None:
+            super().__init__(content=b"", status_code=200)
+
+        async def __call__(self, scope, receive, send):  # noqa: D401
+            return
+
     async def handle_streamable_http(request: Request):
         ok, reason = await _is_authorized(request)
         if not ok:
@@ -492,10 +504,9 @@ def _run_sse() -> None:
         except Exception:
             log.exception("[/sse POST] streamable-http handler error")
             raise
-        # Starlette wants a Response object even though we already wrote
-        # one to send(); returning an empty 200 is harmless because the
-        # response stream is already finished at this point.
-        return Response()
+        # Response already written via request._send – returning a normal
+        # Response would crash with "response already completed".
+        return _AlreadySent()
 
     sessions: dict[str, float] = {}
 
