@@ -444,14 +444,17 @@ def _run_sse() -> None:
     sse = SseServerTransport("/messages/")
     _server = mcp._mcp_server
 
-    # Modern Claude.ai connects with Streamable-HTTP semantics
-    # (POST /sse with a real JSON-RPC payload, not a probe). We MUST
-    # speak Streamable-HTTP on that path or the connector cannot
-    # initialise. Mount the SDK's StreamableHTTPServerTransport in
-    # stateless mode (one transport per request – fits FastMCP's
-    # request-scoped tools).
-    import anyio
-    from mcp.server.streamable_http import StreamableHTTPServerTransport
+    # Modern Claude.ai connects with Streamable-HTTP semantics – one
+    # `initialize` then many tool calls sharing the same Mcp-Session-Id.
+    # StreamableHTTPSessionManager owns the long-lived task group and
+    # session map; it must be entered exactly once via `async with
+    # session_manager.run():` in a Starlette lifespan. Stateless mode
+    # would reject every call after the first with "Received request
+    # before initialization was complete".
+    import contextlib
+    from collections.abc import AsyncIterator
+
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
     class _AlreadySent(Response):
         """No-op response for handlers that have already streamed their
@@ -465,48 +468,31 @@ def _run_sse() -> None:
         async def __call__(self, scope, receive, send):  # noqa: D401
             return
 
+    session_manager = StreamableHTTPSessionManager(
+        app=_server,
+        json_response=True,
+    )
+
     async def handle_streamable_http(request: Request):
         ok, reason = await _is_authorized(request)
         if not ok:
             log.warning("[/sse POST] denied (unauthenticated) reason=%s", reason)
             return _unauthorized(reason)
-        log.info(
+        log.debug(
             "[/sse POST] streamable-http request from %s",
             request.client.host if request.client else "?",
         )
-
-        # ASGI pattern: a Starlette endpoint must return a Response, but
-        # StreamableHTTPServerTransport.handle_request writes the response
-        # to the ASGI `send` callable directly. Using `request._send`
-        # is the same trick we already use for SSE.
-        transport = StreamableHTTPServerTransport(
-            mcp_session_id=None, is_json_response_enabled=True
+        await session_manager.handle_request(
+            request.scope, request.receive, request._send
         )
-        try:
-            async with transport.connect() as streams:
-                async with anyio.create_task_group() as tg:
-
-                    async def _run_server():
-                        try:
-                            await _server.run(
-                                streams[0],
-                                streams[1],
-                                _server.create_initialization_options(),
-                            )
-                        except Exception:
-                            log.exception("[/sse POST] server.run crashed")
-
-                    tg.start_soon(_run_server)
-                    await transport.handle_request(
-                        request.scope, request.receive, request._send
-                    )
-                    tg.cancel_scope.cancel()
-        except Exception:
-            log.exception("[/sse POST] streamable-http handler error")
-            raise
-        # Response already written via request._send – returning a normal
-        # Response would crash with "response already completed".
         return _AlreadySent()
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app: "Starlette") -> AsyncIterator[None]:
+        async with session_manager.run():
+            log.info("StreamableHTTPSessionManager started")
+            yield
+            log.info("StreamableHTTPSessionManager stopping")
 
     sessions: dict[str, float] = {}
 
@@ -581,6 +567,7 @@ def _run_sse() -> None:
             Mount("/messages/", app=handle_messages),
         ],
         middleware=[Middleware(RequestLogMiddleware)],
+        lifespan=lifespan,
     )
 
     port = int(os.getenv("PORT", "8000"))
