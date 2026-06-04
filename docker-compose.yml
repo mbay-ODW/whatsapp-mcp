@@ -27,7 +27,7 @@ services:
       - MCP_API_KEY=${MCP_API_KEY}
       - WHATSAPP_BRIDGE_URL=http://whatsapp-bridge:8080
       - WHATSAPP_DB_PATH=/app/store/messages.db
-      - OIDC_INTROSPECTION_URL=${OIDC_INTROSPECTION_URL:-https://authelia.${DOMAIN}/api/oidc/introspection}}
+      - OIDC_INTROSPECTION_URL=${OIDC_INTROSPECTION_URL:-https://authelia.${DOMAIN}/api/oidc/introspection}
       - OIDC_CLIENT_ID=${OIDC_CLIENT_ID:-whatsapp-mcp}
       - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET}
     volumes:
