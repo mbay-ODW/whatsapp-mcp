@@ -288,6 +288,8 @@ def _run_sse() -> None:
     oidc_introspection_url = os.getenv("OIDC_INTROSPECTION_URL", "")
     oidc_client_id = os.getenv("OIDC_CLIENT_ID", "")
     oidc_client_secret = os.getenv("OIDC_CLIENT_SECRET", "")
+    oauth_issuer = os.getenv("OAUTH_ISSUER", "")
+    mcp_server_url = os.getenv("MCP_SERVER_URL", "")
 
     auth_configured = bool(mcp_api_key) or all(
         (oidc_introspection_url, oidc_client_id, oidc_client_secret)
@@ -557,8 +559,50 @@ def _run_sse() -> None:
     # afterwards) so it definitely wraps the routing layer – otherwise the
     # debug request log silently misses 4xx responses produced by Starlette
     # itself (e.g. method-not-allowed on POST /sse).
+    # ------------------------------------------------------------------
+    # OAuth discovery endpoints (RFC 9728 + RFC 8414) – must be public
+    # (no auth) so Claude.ai can bootstrap the OAuth flow.
+    # ------------------------------------------------------------------
+    from starlette.responses import JSONResponse
+
+    async def handle_oauth_protected_resource(request: Request):
+        log.info("[discovery] /.well-known/oauth-protected-resource hit")
+        return JSONResponse({
+            "resource": mcp_server_url or str(request.base_url).rstrip("/"),
+            "authorization_servers": [oauth_issuer] if oauth_issuer else [],
+            "bearer_methods_supported": ["header"],
+            "scopes_supported": ["openid", "profile", "email"],
+        })
+
+    async def handle_oauth_authorization_server(request: Request):
+        log.info("[discovery] /.well-known/oauth-authorization-server hit")
+        if oauth_issuer:
+            try:
+                async with _httpx.AsyncClient(timeout=5.0) as http:
+                    upstream = await http.get(
+                        f"{oauth_issuer}/.well-known/oauth-authorization-server"
+                    )
+                    if upstream.status_code == 200:
+                        return JSONResponse(upstream.json())
+            except Exception as e:
+                log.warning("[discovery] upstream fetch failed: %s", e)
+        return JSONResponse({
+            "issuer": oauth_issuer,
+            "authorization_endpoint": f"{oauth_issuer}/api/oidc/authorization",
+            "token_endpoint": f"{oauth_issuer}/api/oidc/token",
+            "jwks_uri": f"{oauth_issuer}/jwks.json",
+            "introspection_endpoint": f"{oauth_issuer}/api/oidc/introspection",
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "code_challenge_methods_supported": ["S256"],
+            "scopes_supported": ["openid", "profile", "email"],
+        })
+
     app = Starlette(
         routes=[
+            # Public OAuth discovery – no auth required.
+            Route("/.well-known/oauth-protected-resource", endpoint=handle_oauth_protected_resource, methods=["GET"]),
+            Route("/.well-known/oauth-authorization-server", endpoint=handle_oauth_authorization_server, methods=["GET"]),
             # Streamable-HTTP (current spec) – Claude.ai uses this first.
             Route("/sse", endpoint=handle_streamable_http, methods=["POST"]),
             Route("/mcp", endpoint=handle_streamable_http, methods=["POST"]),
