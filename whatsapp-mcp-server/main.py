@@ -1,5 +1,7 @@
+import logging
 from typing import List, Dict, Any, Optional, Union
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
     list_messages as whatsapp_list_messages,
@@ -15,8 +17,20 @@ from whatsapp import (
     download_media as whatsapp_download_media
 )
 
-# Initialize FastMCP server
-mcp = FastMCP("whatsapp")
+# Initialize MCP server
+class KlartextServer(MCPServer):
+    """mcp 2.x verbirgt den Text unerwarteter Exceptions vor dem Client ("Error executing tool X").
+    Die Tools hier melden ihre Fehler so ans Modell, daher bleibt der Text wie in mcp 1.x erhalten."""
+
+    async def call_tool(self, name, arguments, context=None):  # type: ignore[no-untyped-def]
+        try:
+            return await super().call_tool(name, arguments, context)
+        except UnexpectedToolError as exc:
+            logging.getLogger("mcp.server.mcpserver").exception("Tool %r raised an unexpected exception", name)
+            raise ToolError(f"{exc}: {exc.__cause__}") from exc.__cause__
+
+
+mcp = KlartextServer("whatsapp")
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
@@ -267,7 +281,7 @@ def _run_sse() -> None:
     # ------------------------------------------------------------------
     _log_level = os.getenv("LOG_LEVEL", "INFO").upper()
     _level_int = getattr(logging, _log_level, logging.INFO)
-    # `force=True` is required because uvicorn / FastMCP install root
+    # `force=True` is required because uvicorn / MCPServer install root
     # handlers before we get here, which would make a plain basicConfig()
     # silently a no-op (and DEBUG lines would never show up).
     logging.basicConfig(
@@ -444,7 +458,7 @@ def _run_sse() -> None:
             return response
 
     sse = SseServerTransport("/messages/")
-    _server = mcp._mcp_server
+    _server = mcp._lowlevel_server
 
     # Modern Claude.ai connects with Streamable-HTTP semantics – one
     # `initialize` then many tool calls sharing the same Mcp-Session-Id.
