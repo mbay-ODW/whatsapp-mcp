@@ -239,11 +239,11 @@ def list_messages(
             seen_ids = set()
             for msg in result:
                 context = get_message_context(msg.id, context_before, context_after)
-                for m in context.before + [context.message] + context.after:
-                    if m.id not in seen_ids:
-                        seen_ids.add(m.id)
+                for m in context["before"] + [context["message"]] + context["after"]:
+                    if m["id"] not in seen_ids:
+                        seen_ids.add(m["id"])
                         messages_with_context.append(m)
-            return [message_to_dict(m) for m in messages_with_context]
+            return messages_with_context
 
         return [message_to_dict(m) for m in result]
 
